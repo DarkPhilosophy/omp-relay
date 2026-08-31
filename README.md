@@ -70,29 +70,30 @@ omp plugin link .
 
 ## Run the relay server
 
-Keep the binary outside the source checkout and run it through a process supervisor. A systemd user service can use:
+Keep the binary in a stable location. On Linux with systemd, the relay can install and manage its own user service:
 
-```ini
-[Unit]
-Description=OMP authenticated AI provider relay
-After=network-online.target
-Wants=network-online.target
+```bash
+install -Dm755 omp-relayd ~/.local/bin/omp-relayd
 
-[Service]
-Type=simple
-ExecStartPre=/usr/bin/mkdir -p %h/.local/state/omp-relay
-ExecStart=%h/.local/bin/omp-relayd \
-  --registry %h/.local/state/omp-relay/registry.json \
+~/.local/bin/omp-relayd \
+  --registry ~/.local/state/omp-relay/registry.json \
+  service install --bind 10.90.0.2:43118
+
+~/.local/bin/omp-relayd service status
+```
+
+The install command creates a hardened systemd user unit, reloads systemd, and enables the relay immediately. Use `service install --no-enable` to write the unit without starting it, or remove it later with:
+
+```bash
+~/.local/bin/omp-relayd service uninstall
+```
+
+On systems without systemd, run the process through your preferred supervisor:
+
+```bash
+omp-relayd \
+  --registry ~/.local/state/omp-relay/registry.json \
   serve --bind 10.90.0.2:43118
-Restart=on-failure
-RestartSec=3
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.local/state/omp-relay
-
-[Install]
-WantedBy=default.target
 ```
 
 Bind to a private WireGuard, NetBird, Tailscale, LAN, or similarly protected interface. Do not expose the relay directly to the public internet without an additional network-security layer.
@@ -168,7 +169,7 @@ omp-relayd self-test
 
 ## Release model
 
-A stable version tag such as `v0.1.0` runs the release workflow:
+A stable version tag such as `v0.1.1` runs the release workflow:
 
 1. scans locked npm dependencies for known vulnerabilities;
 2. builds and self-tests static x86-64 and ARM64 Linux relay binaries;

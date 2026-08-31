@@ -1,7 +1,14 @@
 import { readFile, stat } from "node:fs/promises";
 import { $ } from "bun";
 
-const required = ["README.md", "LICENSE", "src/index.ts", "relayd/Cargo.toml", "relayd/src/main.rs"];
+const required = [
+	"README.md",
+	"LICENSE",
+	".github/CHANGELOG.md",
+	"src/index.ts",
+	"relayd/Cargo.toml",
+	"relayd/src/main.rs",
+];
 for (const path of required) {
 	const metadata = await stat(path);
 	if (!metadata.isFile() || metadata.size === 0) throw new Error(`required package file is empty: ${path}`);
@@ -22,13 +29,13 @@ if (cargoLicense !== manifest.license) throw new Error("npm and Cargo licenses m
 const packOutput = await $`npm pack --dry-run --json`.text();
 const [{ files = [] }] = JSON.parse(packOutput);
 const packedPaths = new Set(files.map(({ path }) => path));
-for (const path of ["README.md", "LICENSE", "package.json", "src/index.ts"]) {
+for (const path of ["README.md", "LICENSE", ".github/CHANGELOG.md", "package.json", "src/index.ts"]) {
 	if (!packedPaths.has(path)) throw new Error(`missing npm package asset: ${path}`);
 }
 for (const path of packedPaths) {
-	if (["tests/", ".scripts/", ".github/", "relayd/", "node_modules/"].some((prefix) => path.startsWith(prefix))) {
-		throw new Error(`unexpected npm package asset: ${path}`);
-	}
+	const isForbidden = ["tests/", ".scripts/", "relayd/", "node_modules/"].some((prefix) => path.startsWith(prefix));
+	const isUnexpectedGitHubFile = path.startsWith(".github/") && path !== ".github/CHANGELOG.md";
+	if (isForbidden || isUnexpectedGitHubFile) throw new Error(`unexpected npm package asset: ${path}`);
 }
 
 console.log("Package structure and npm contents are complete.");

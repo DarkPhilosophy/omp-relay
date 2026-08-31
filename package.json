@@ -1,6 +1,6 @@
 {
 	"name": "omp-relay",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Authenticated OMP forward relay for geo-restricted providers and simple traffic rerouting",
 	"keywords": [
 		"oh-my-pi",
@@ -34,6 +34,7 @@
 	"files": [
 		"src",
 		"README.md",
+		".github/CHANGELOG.md",
 		"LICENSE"
 	],
 	"scripts": {
