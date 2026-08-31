@@ -91,7 +91,7 @@ async fn connect_tunnel(
     };
     let addresses = match resolve_public_target(parsed.host(), port).await {
         Ok(addresses) => addresses,
-        Err(response) => return response,
+        Err(error) => return target_error_response(error),
     };
     let started = Instant::now();
     let state_for_upgrade = state.clone();
@@ -145,8 +145,8 @@ async fn forward_http(
             80
         }
     });
-    if let Err(response) = resolve_public_target(host, port).await {
-        return response;
+    if let Err(error) = resolve_public_target(host, port).await {
+        return target_error_response(error);
     }
     let method = request.method().clone();
     let (parts, body) = request.into_parts();
@@ -187,32 +187,33 @@ async fn forward_http(
     response
 }
 
-async fn resolve_public_target(host: &str, port: u16) -> Result<Vec<SocketAddr>, Response> {
+#[derive(Debug)]
+enum TargetError {
+    Forbidden,
+    Resolution(String),
+    Empty,
+}
+
+async fn resolve_public_target(host: &str, port: u16) -> Result<Vec<SocketAddr>, TargetError> {
     let normalized = host.trim_matches(['[', ']']).to_ascii_lowercase();
     if normalized == "localhost"
         || normalized.ends_with(".localhost")
         || normalized == "metadata.google.internal"
     {
-        return Err(target_forbidden());
+        return Err(TargetError::Forbidden);
     }
     let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|error| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("target resolution failed: {error}"),
-            )
-                .into_response()
-        })?
+        .map_err(|error| TargetError::Resolution(error.to_string()))?
         .collect();
     if addresses.is_empty() {
-        return Err((StatusCode::BAD_GATEWAY, "target resolved to no addresses").into_response());
+        return Err(TargetError::Empty);
     }
     if addresses
         .iter()
         .any(|address| is_disallowed_ip(address.ip()))
     {
-        return Err(target_forbidden());
+        return Err(TargetError::Forbidden);
     }
     Ok(addresses)
 }
@@ -228,12 +229,22 @@ async fn connect_any(addresses: &[SocketAddr]) -> std::io::Result<tokio::net::Tc
     Err(last_error.unwrap_or_else(|| std::io::Error::other("target resolved to no addresses")))
 }
 
-fn target_forbidden() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        "proxy target is not allowed: loopback, private, link-local, metadata, and other non-public destinations are blocked",
-    )
-        .into_response()
+fn target_error_response(error: TargetError) -> Response {
+    match error {
+        TargetError::Forbidden => (
+            StatusCode::FORBIDDEN,
+            "proxy target is not allowed: loopback, private, link-local, metadata, and other non-public destinations are blocked",
+        )
+            .into_response(),
+        TargetError::Resolution(error) => (
+            StatusCode::BAD_GATEWAY,
+            format!("target resolution failed: {error}"),
+        )
+            .into_response(),
+        TargetError::Empty => {
+            (StatusCode::BAD_GATEWAY, "target resolved to no addresses").into_response()
+        }
+    }
 }
 
 fn is_disallowed_ip(ip: IpAddr) -> bool {
