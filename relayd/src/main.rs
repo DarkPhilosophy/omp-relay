@@ -6,7 +6,7 @@ mod ws;
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -32,6 +32,10 @@ use registry::{Registry, registry_lock, registry_path, registry_read_lock, token
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Minimum seconds between durable `last_seen` writes per client.
+const LAST_SEEN_FLUSH_SECS: u64 = 60;
+const MAX_PINNED_CLIENTS: usize = 128;
+
 #[derive(Parser)]
 #[command(
     name = "omp-relayd",
@@ -56,8 +60,29 @@ enum Command {
     Revoke {
         uuid: Uuid,
     },
+    /// Install, remove, or inspect a systemd user service for the relay (Linux).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Run deterministic local checks without starting a listener or changing the real registry.
     SelfTest,
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Write a systemd user unit, then enable and start it.
+    Install {
+        #[arg(long, default_value = "0.0.0.0:8787")]
+        bind: SocketAddr,
+        /// Write the unit file only; do not enable or start the service.
+        #[arg(long)]
+        no_enable: bool,
+    },
+    /// Stop, disable, and remove the systemd user unit.
+    Uninstall,
+    /// Show the systemd user service status.
+    Status,
 }
 
 #[derive(Clone)]
@@ -74,6 +99,12 @@ pub struct AppState {
     active_streams: AtomicUsize,
     pair_attempts: Mutex<HashMap<IpAddr, PairRateWindow>>,
     http_client: reqwest::Client,
+    pinned_clients: Mutex<HashMap<String, PinnedHttpClient>>,
+}
+#[derive(Clone)]
+pub struct PinnedHttpClient {
+    client: reqwest::Client,
+    addresses: Vec<SocketAddr>,
 }
 
 struct PairRateWindow {
@@ -160,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             registry.save(&path)?;
             println!("Revoked {uuid}");
         }
+        Command::Service { action } => service(&path, action)?,
         Command::SelfTest => self_test()?,
     }
     Ok(())
@@ -193,6 +225,134 @@ fn self_test() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+const SERVICE_UNIT: &str = "omp-relayd.service";
+
+fn service(registry: &Path, action: ServiceAction) -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(target_os = "linux") {
+        return Err("service management is supported only on Linux with systemd".into());
+    }
+    let unit_path = service_unit_path()?;
+    match action {
+        ServiceAction::Install { bind, no_enable } => {
+            let exe = std::env::current_exe()?;
+            let registry = absolute_path(registry)?;
+            prepare_registry_directory(&registry)?;
+            let unit = render_service_unit(&exe, &registry, bind)?;
+            if let Some(parent) = unit_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&unit_path, unit)?;
+            println!("Wrote {}", unit_path.display());
+            systemctl(["daemon-reload"])?;
+            if no_enable {
+                println!("Service unit written; not enabled (--no-enable).");
+            } else {
+                systemctl(["enable", "--now", SERVICE_UNIT])?;
+                println!("Enabled and started {SERVICE_UNIT}.");
+            }
+        }
+        ServiceAction::Uninstall => {
+            let _ = systemctl(["disable", "--now", SERVICE_UNIT]);
+            if unit_path.exists() {
+                std::fs::remove_file(&unit_path)?;
+                println!("Removed {}", unit_path.display());
+            } else {
+                println!("No unit file at {}", unit_path.display());
+            }
+            systemctl(["daemon-reload"])?;
+        }
+        ServiceAction::Status => {
+            systemctl(["status", "--no-pager", SERVICE_UNIT])?;
+        }
+    }
+    Ok(())
+}
+
+fn service_unit_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let config = dirs::config_dir().ok_or("could not resolve user config directory")?;
+    Ok(config.join("systemd").join("user").join(SERVICE_UNIT))
+}
+
+fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_owned())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn prepare_registry_directory(registry: &Path) -> std::io::Result<()> {
+    let Some(parent) = registry.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn render_service_unit(
+    exe: &Path,
+    registry: &Path,
+    bind: SocketAddr,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let exe = systemd_quote_path(exe)?;
+    let registry_arg = systemd_quote_path(registry)?;
+    let registry_directory =
+        systemd_quote_path(registry.parent().unwrap_or_else(|| Path::new(".")))?;
+    Ok(format!(
+        "[Unit]\n\
+Description=OMP authenticated AI provider relay\n\
+After=network-online.target\n\
+Wants=network-online.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart={exe} --registry {registry_arg} serve --bind {bind}\n\
+Restart=on-failure\n\
+RestartSec=2\n\
+UMask=0077\n\
+NoNewPrivileges=true\n\
+PrivateTmp=true\n\
+ProtectSystem=strict\n\
+ProtectHome=read-only\n\
+ReadWritePaths={registry_directory}\n\
+\n\
+[Install]\n\
+WantedBy=default.target\n"
+    ))
+}
+
+fn systemd_quote_path(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let value = path
+        .to_str()
+        .ok_or("systemd service paths must be valid UTF-8")?;
+    if value.chars().any(char::is_control) {
+        return Err("systemd service paths cannot contain control characters".into());
+    }
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    Ok(format!("\"{escaped}\""))
+}
+
+fn systemctl<const N: usize>(args: [&str; N]) -> Result<(), Box<dyn std::error::Error>> {
+    let status = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .map_err(|error| format!("failed to run systemctl: {error}"))?;
+    if !status.success() {
+        return Err(format!("systemctl {} failed", args.join(" ")).into());
+    }
+    Ok(())
+}
+
 async fn serve(path: PathBuf, bind: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let registry = {
         let _lock = registry_read_lock(&path)?;
@@ -208,6 +368,7 @@ async fn serve(path: PathBuf, bind: SocketAddr) -> Result<(), Box<dyn std::error
         http_client: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .build()?,
+        pinned_clients: Mutex::new(HashMap::new()),
     });
     let app = Router::new()
         .route("/pair", post(pair))
@@ -339,48 +500,43 @@ pub async fn authenticate_token(
     };
     let presented_hash = token_hash(token);
     let registry_path = state.registry_path.clone();
-    let disk_registry = tokio::task::spawn_blocking(move || {
-        let _lock = registry_read_lock(&registry_path)?;
-        Registry::load(&registry_path)
+    let now = unix_time();
+    let (name, disk_registry) = tokio::task::spawn_blocking(move || {
+        authenticate_disk(&registry_path, uuid, &presented_hash, now)
     })
     .await
-    .map_err(|error| internal_error(format!("registry read task failed: {error}")))?
+    .map_err(|error| internal_error(format!("registry auth task failed: {error}")))?
     .map_err(internal_error)?;
-    let authenticated = disk_registry
-        .clients
-        .iter()
-        .find(|client| {
-            client.uuid == uuid
-                && constant_time_equal(client.token_sha256.as_bytes(), presented_hash.as_bytes())
-        })
-        .map(|client| AuthenticatedClient {
-            uuid,
-            name: client.name.clone(),
-        });
     *state.registry.write().await = disk_registry;
-    let Some(authenticated) = authenticated else {
+    let Some(name) = name else {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthorized" })),
         )
             .into_response());
     };
-    touch_last_seen(state, uuid).await;
-    Ok(authenticated)
+    Ok(AuthenticatedClient { uuid, name })
 }
-
-async fn touch_last_seen(state: &AppState, uuid: Uuid) {
-    let now = unix_time();
-    if let Some(client) = state
-        .registry
-        .write()
-        .await
-        .clients
-        .iter_mut()
-        .find(|client| client.uuid == uuid)
-    {
+fn authenticate_disk(
+    path: &std::path::Path,
+    uuid: Uuid,
+    presented_hash: &str,
+    now: u64,
+) -> std::io::Result<(Option<String>, Registry)> {
+    let _lock = registry_lock(path)?;
+    let mut registry = Registry::load(path)?;
+    let Some(client) = registry.clients.iter_mut().find(|client| {
+        client.uuid == uuid
+            && constant_time_equal(client.token_sha256.as_bytes(), presented_hash.as_bytes())
+    }) else {
+        return Ok((None, registry));
+    };
+    let name = client.name.clone();
+    if now.saturating_sub(client.last_seen) >= LAST_SEEN_FLUSH_SECS {
         client.last_seen = now;
+        registry.save(path)?;
     }
+    Ok((Some(name), registry))
 }
 
 async fn allow_pair_attempt(state: &AppState, ip: IpAddr) -> bool {
@@ -439,5 +595,88 @@ async fn shutdown_signal() {
     tokio::select! {
         () = interrupt => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_registry() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("omp-relayd-main-test-{}", Uuid::new_v4()))
+            .join("registry.json")
+    }
+
+    #[test]
+    fn authentication_persists_last_seen_without_reviving_revoked_clients() {
+        let path = temporary_registry();
+        let mut registry = Registry::default();
+        let created = 1_000;
+        let (uuid, token) = registry.add_client("test client".into(), created);
+        registry.save(&path).expect("registry saves");
+
+        let seen = created + LAST_SEEN_FLUSH_SECS;
+        let (name, _) = authenticate_disk(&path, uuid, &token_hash(&token), seen)
+            .expect("authentication succeeds");
+        assert_eq!(name.as_deref(), Some("test client"));
+        let persisted = Registry::load(&path).expect("registry reloads");
+        assert_eq!(persisted.clients[0].last_seen, seen);
+
+        {
+            let _lock = registry_lock(&path).expect("registry locks");
+            let mut registry = Registry::load(&path).expect("registry reloads for revocation");
+            assert!(registry.revoke(uuid));
+            registry.save(&path).expect("revocation saves");
+        }
+        let (name, registry) = authenticate_disk(&path, uuid, &token_hash(&token), seen + 1)
+            .expect("revoked authentication is handled");
+        assert!(name.is_none());
+        assert!(registry.clients.is_empty());
+        assert!(
+            Registry::load(&path)
+                .expect("registry reloads")
+                .clients
+                .is_empty()
+        );
+
+        std::fs::remove_dir_all(path.parent().expect("registry parent exists"))
+            .expect("temporary registry is removed");
+    }
+
+    #[test]
+    fn service_unit_quotes_paths_and_applies_sandboxing() {
+        let unit = render_service_unit(
+            Path::new("/opt/OMP Relay/omp-relayd"),
+            Path::new("/home/alex/%relay/registry.json"),
+            "10.90.0.2:43118".parse().expect("bind address parses"),
+        )
+        .expect("unit renders");
+        assert!(unit.contains("ExecStart=\"/opt/OMP Relay/omp-relayd\""));
+        assert!(unit.contains("--registry \"/home/alex/%%relay/registry.json\""));
+        assert!(unit.contains("ReadWritePaths=\"/home/alex/%%relay\""));
+        assert!(unit.contains("ProtectSystem=strict"));
+        assert!(unit.contains("ProtectHome=read-only"));
+        assert!(unit.contains("UMask=0077"));
+    }
+
+    #[test]
+    fn service_actions_are_direct_subcommands() {
+        let install = Cli::try_parse_from(["omp-relayd", "service", "install"])
+            .expect("service install parses");
+        assert!(matches!(
+            install.command,
+            Command::Service {
+                action: ServiceAction::Install { .. }
+            }
+        ));
+        let status = Cli::try_parse_from(["omp-relayd", "service", "status"])
+            .expect("service status parses");
+        assert!(matches!(
+            status.command,
+            Command::Service {
+                action: ServiceAction::Status
+            }
+        ));
     }
 }

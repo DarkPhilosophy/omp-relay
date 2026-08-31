@@ -15,7 +15,9 @@ use futures_util::TryStreamExt;
 use hyper_util::rt::TokioIo;
 use tokio::io::copy_bidirectional;
 
-use crate::{AppState, AuthenticatedClient, authenticate_token};
+use crate::{
+    AppState, AuthenticatedClient, MAX_PINNED_CLIENTS, PinnedHttpClient, authenticate_token,
+};
 
 pub async fn forward_proxy(
     State(state): State<Arc<AppState>>,
@@ -149,7 +151,7 @@ async fn forward_http(
         Ok(addresses) => addresses,
         Err(error) => return target_error_response(error),
     };
-    let client = match pinned_http_client(host, &addresses) {
+    let client = match cached_pinned_client(&state, host, port, &addresses).await {
         Ok(client) => client,
         Err(error) => {
             return (
@@ -206,6 +208,41 @@ fn pinned_http_client(
         .connect_timeout(Duration::from_secs(30))
         .resolve_to_addrs(host, addresses)
         .build()
+}
+
+async fn cached_pinned_client(
+    state: &AppState,
+    host: &str,
+    port: u16,
+    addresses: &[SocketAddr],
+) -> Result<reqwest::Client, reqwest::Error> {
+    let key = format!("{}:{port}", host.to_ascii_lowercase());
+    let mut validated_addresses = addresses.to_vec();
+    validated_addresses.sort_unstable();
+    validated_addresses.dedup();
+
+    let mut cache = state.pinned_clients.lock().await;
+    if let Some(entry) = cache.get(&key)
+        && entry.addresses == validated_addresses
+    {
+        return Ok(entry.client.clone());
+    }
+
+    let client = pinned_http_client(host, &validated_addresses)?;
+    if !cache.contains_key(&key)
+        && cache.len() >= MAX_PINNED_CLIENTS
+        && let Some(oldest_key) = cache.keys().next().cloned()
+    {
+        cache.remove(&oldest_key);
+    }
+    cache.insert(
+        key,
+        PinnedHttpClient {
+            client: client.clone(),
+            addresses: validated_addresses,
+        },
+    );
+    Ok(client)
 }
 
 #[derive(Debug)]
@@ -369,5 +406,54 @@ mod tests {
         let addresses = [SocketAddr::from(([93, 184, 216, 34], 443))];
         assert!(pinned_http_client("example.com", &addresses).is_ok());
         assert!(pinned_http_client("api.example.com", &addresses).is_ok());
+    }
+
+    fn test_state() -> AppState {
+        AppState {
+            registry_path: std::path::PathBuf::new(),
+            registry: tokio::sync::RwLock::new(crate::registry::Registry::default()),
+            started: Instant::now(),
+            debug: std::sync::atomic::AtomicBool::new(false),
+            active_streams: std::sync::atomic::AtomicUsize::new(0),
+            pair_attempts: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            http_client: reqwest::Client::new(),
+            pinned_clients: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_cache_is_bounded_and_refreshes_changed_dns_answers() {
+        let state = test_state();
+        let first = [SocketAddr::from(([93, 184, 216, 34], 443))];
+        cached_pinned_client(&state, "example.com", 443, &first)
+            .await
+            .expect("first client builds");
+        cached_pinned_client(&state, "example.com", 443, &first)
+            .await
+            .expect("cached client is reused");
+        assert_eq!(state.pinned_clients.lock().await.len(), 1);
+
+        let changed = [SocketAddr::from(([93, 184, 216, 35], 443))];
+        cached_pinned_client(&state, "example.com", 443, &changed)
+            .await
+            .expect("changed DNS answer refreshes the client");
+        assert_eq!(
+            state
+                .pinned_clients
+                .lock()
+                .await
+                .get("example.com:443")
+                .expect("cache entry exists")
+                .addresses,
+            changed
+        );
+
+        for index in 0..=MAX_PINNED_CLIENTS {
+            let host = format!("api-{index}.example.com");
+            cached_pinned_client(&state, &host, 443, &first)
+                .await
+                .expect("client builds");
+        }
+        assert_eq!(state.pinned_clients.lock().await.len(), MAX_PINNED_CLIENTS);
     }
 }
