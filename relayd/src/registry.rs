@@ -45,6 +45,18 @@ impl Drop for RegistryLock {
 }
 
 pub fn registry_lock(path: &Path) -> io::Result<RegistryLock> {
+    let file = open_lock_file(path)?;
+    file.lock()?;
+    Ok(RegistryLock(file))
+}
+
+pub fn registry_read_lock(path: &Path) -> io::Result<RegistryLock> {
+    let file = open_lock_file(path)?;
+    file.lock_shared()?;
+    Ok(RegistryLock(file))
+}
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -53,9 +65,7 @@ pub fn registry_lock(path: &Path) -> io::Result<RegistryLock> {
     options.read(true).write(true).create(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let file = options.open(lock_path)?;
-    file.lock()?;
-    Ok(RegistryLock(file))
+    options.open(lock_path)
 }
 
 impl Registry {
@@ -83,6 +93,7 @@ impl Registry {
         file.write_all(&data)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
+        sync_parent_directory(path)?;
         Ok(())
     }
 
@@ -139,6 +150,20 @@ impl Registry {
         self.clients.retain(|client| client.uuid != uuid);
         original_length != self.clients.len()
     }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 pub fn registry_path() -> io::Result<PathBuf> {
