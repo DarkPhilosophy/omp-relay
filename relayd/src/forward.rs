@@ -198,7 +198,10 @@ async fn forward_http(
     response
 }
 
-fn pinned_http_client(host: &str, addresses: &[SocketAddr]) -> Result<reqwest::Client, reqwest::Error> {
+fn pinned_http_client(
+    host: &str,
+    addresses: &[SocketAddr],
+) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .resolve_to_addrs(host, addresses)
