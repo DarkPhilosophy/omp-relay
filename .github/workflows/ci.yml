@@ -33,7 +33,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: relayd
+          workspaces: relayd -> target
       - run: cargo fmt --manifest-path relayd/Cargo.toml --check
       - run: cargo clippy --manifest-path relayd/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path relayd/Cargo.toml

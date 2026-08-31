@@ -28,6 +28,7 @@ pub async fn forward_proxy(
     forward_http(state, peer, authenticated, request).await
 }
 
+#[allow(clippy::result_large_err)]
 async fn authenticate_proxy(
     state: &AppState,
     headers: &HeaderMap,

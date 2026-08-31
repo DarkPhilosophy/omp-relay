@@ -49,7 +49,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: relayd
+          workspaces: relayd -> target
           key: ${{ matrix.target }}
 
       - name: Build static relay binary

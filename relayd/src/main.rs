@@ -308,6 +308,7 @@ async fn debug(
     Json(json!({ "debug": request.enabled })).into_response()
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn authenticate(
     state: &AppState,
     headers: &HeaderMap,
@@ -325,6 +326,7 @@ pub async fn authenticate(
     authenticate_token(state, value).await
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn authenticate_token(
     state: &AppState,
     value: &str,
