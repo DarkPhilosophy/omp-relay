@@ -1,4 +1,8 @@
-use std::{net::{IpAddr, SocketAddr}, sync::Arc, time::Instant};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Instant,
+};
 
 use axum::{
     body::Body,
@@ -132,7 +136,10 @@ async fn forward_http(
         return (StatusCode::BAD_REQUEST, "proxy target host missing").into_response();
     };
     let port = uri.port_u16().unwrap_or_else(|| {
-        if uri.scheme_str().is_some_and(|scheme| scheme.eq_ignore_ascii_case("https")) {
+        if uri
+            .scheme_str()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+        {
             443
         } else {
             80
@@ -191,13 +198,20 @@ async fn resolve_public_target(host: &str, port: u16) -> Result<Vec<SocketAddr>,
     let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .map_err(|error| {
-            (StatusCode::BAD_GATEWAY, format!("target resolution failed: {error}")).into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("target resolution failed: {error}"),
+            )
+                .into_response()
         })?
         .collect();
     if addresses.is_empty() {
         return Err((StatusCode::BAD_GATEWAY, "target resolved to no addresses").into_response());
     }
-    if addresses.iter().any(|address| is_disallowed_ip(address.ip())) {
+    if addresses
+        .iter()
+        .any(|address| is_disallowed_ip(address.ip()))
+    {
         return Err(target_forbidden());
     }
     Ok(addresses)
@@ -286,8 +300,14 @@ mod tests {
     #[test]
     fn rejects_non_public_ipv6_ranges() {
         assert!(is_disallowed_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(is_disallowed_ip(IpAddr::V6("fd00::1".parse().expect("ULA parses"))));
-        assert!(is_disallowed_ip(IpAddr::V6("fe80::1".parse().expect("link-local parses"))));
-        assert!(!is_disallowed_ip(IpAddr::V6("2606:4700:4700::1111".parse().expect("public IPv6 parses"))));
+        assert!(is_disallowed_ip(IpAddr::V6(
+            "fd00::1".parse().expect("ULA parses")
+        )));
+        assert!(is_disallowed_ip(IpAddr::V6(
+            "fe80::1".parse().expect("link-local parses")
+        )));
+        assert!(!is_disallowed_ip(IpAddr::V6(
+            "2606:4700:4700::1111".parse().expect("public IPv6 parses")
+        )));
     }
 }
