@@ -229,14 +229,29 @@ mod tests {
     fn registry_files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = std::env::temp_dir().join(format!("omp-relayd-mode-test-{}", Uuid::new_v4()));
+        let directory =
+            std::env::temp_dir().join(format!("omp-relayd-mode-test-{}", Uuid::new_v4()));
         let path = directory.join("registry.json");
         let registry = Registry::default();
         let lock = registry_lock(&path).expect("registry lock is acquired");
         registry.save(&path).expect("registry saves");
 
-        assert_eq!(fs::metadata(&path).expect("registry metadata").permissions().mode() & 0o777, 0o600);
-        assert_eq!(fs::metadata(path.with_extension("lock")).expect("lock metadata").permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("registry metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.with_extension("lock"))
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
 
         drop(lock);
         fs::remove_dir_all(directory).expect("temporary registry directory is removed");
