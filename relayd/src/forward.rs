@@ -1,7 +1,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -145,12 +145,23 @@ async fn forward_http(
             80
         }
     });
-    if let Err(error) = resolve_public_target(host, port).await {
-        return target_error_response(error);
-    }
+    let addresses = match resolve_public_target(host, port).await {
+        Ok(addresses) => addresses,
+        Err(error) => return target_error_response(error),
+    };
+    let client = match pinned_http_client(host, &addresses) {
+        Ok(client) => client,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to construct pinned HTTP client: {error}"),
+            )
+                .into_response();
+        }
+    };
     let method = request.method().clone();
     let (parts, body) = request.into_parts();
-    let mut builder = state.http_client.request(method.clone(), uri.to_string());
+    let mut builder = client.request(method.clone(), uri.to_string());
     for (name, value) in parts.headers {
         let Some(name) = name else { continue };
         if is_proxy_or_hop_header(&name) {
@@ -185,6 +196,13 @@ async fn forward_http(
         tracing::info!(client = %authenticated.uuid, client_name = %authenticated.name, peer = %peer.ip(), method = %method, target = %uri, status = %status, duration_ms = started.elapsed().as_millis(), "proxied absolute HTTP request");
     }
     response
+}
+
+fn pinned_http_client(host: &str, addresses: &[SocketAddr]) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .resolve_to_addrs(host, addresses)
+        .build()
 }
 
 #[derive(Debug)]
@@ -249,18 +267,11 @@ fn target_error_response(error: TargetError) -> Response {
 
 fn is_disallowed_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || ip.is_broadcast()
-                || ip.is_multicast()
-                || octets[0] == 0
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-        }
+        IpAddr::V4(ip) => is_disallowed_ipv4(ip),
         IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_disallowed_ipv4(mapped);
+            }
             ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
@@ -268,6 +279,18 @@ fn is_disallowed_ip(ip: IpAddr) -> bool {
                 || ip.is_unicast_link_local()
         }
     }
+}
+
+fn is_disallowed_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
 }
 
 fn is_proxy_or_hop_header(name: &axum::http::HeaderName) -> bool {
@@ -320,5 +343,28 @@ mod tests {
         assert!(!is_disallowed_ip(IpAddr::V6(
             "2606:4700:4700::1111".parse().expect("public IPv6 parses")
         )));
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_ipv6_private_ranges() {
+        for ip in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:172.16.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:169.254.169.254",
+        ] {
+            let ip: Ipv6Addr = ip.parse().expect("mapped IPv6 parses");
+            assert!(is_disallowed_ip(IpAddr::V6(ip)), "{ip} should be blocked");
+        }
+        let public: Ipv6Addr = "::ffff:8.8.8.8".parse().expect("mapped IPv6 parses");
+        assert!(!is_disallowed_ip(IpAddr::V6(public)));
+    }
+
+    #[test]
+    fn pinned_client_accepts_validated_addresses_for_http_and_https_hosts() {
+        let addresses = [SocketAddr::from(([93, 184, 216, 34], 443))];
+        assert!(pinned_http_client("example.com", &addresses).is_ok());
+        assert!(pinned_http_client("api.example.com", &addresses).is_ok());
     }
 }
