@@ -1,0 +1,7 @@
+node_modules/
+*.tgz
+coverage/
+relay-data/
+relayd/target/
+.DS_Store
+*.log

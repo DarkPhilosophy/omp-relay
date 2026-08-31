@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible OMP Relay defect
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include relay tokens, provider credentials, registry files, or private addresses.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: OMP Relay commit or release and OMP version
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - OMP extension
+        - Rust relay server
+        - Pairing or authentication
+        - HTTP/SSE streaming
+        - WebSocket or CONNECT tunneling
+        - Status widget
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal steps, expected result, and actual result
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Relevant logs with credentials and private addresses removed

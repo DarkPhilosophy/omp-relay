@@ -1,0 +1,154 @@
+name: Publish stable release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  actions: read
+  security-events: write
+
+jobs:
+  security:
+    name: Dependency vulnerabilities
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@8dc09193bb540e09b23da07ad7e30bd33bf87018 # v2.3.8
+    with:
+      scan-args: --lockfile=bun.lock
+      upload-sarif: false
+      fail-on-vuln: true
+
+  build-relay:
+    name: Build relay (${{ matrix.target }})
+    needs: security
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: omp-relayd-linux-x86_64.tar.gz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            archive: omp-relayd-linux-aarch64.tar.gz
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: relayd
+          key: ${{ matrix.target }}
+
+      - name: Build static relay binary
+        env:
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+        run: cargo build --locked --manifest-path relayd/Cargo.toml --release --target "${{ matrix.target }}"
+
+      - name: Verify static executable
+        run: |
+          BINARY="relayd/target/${{ matrix.target }}/release/omp-relayd"
+          test -x "$BINARY"
+          "$BINARY" --version
+          "$BINARY" self-test
+          if ldd "$BINARY" 2>&1 | grep -qv "not a dynamic executable\|statically linked"; then
+            echo "release binary is dynamically linked" >&2
+            ldd "$BINARY" >&2
+            exit 1
+          fi
+
+      - name: Package release asset
+        run: |
+          mkdir -p dist
+          cp "relayd/target/${{ matrix.target }}/release/omp-relayd" dist/omp-relayd
+          tar -C dist -czf "${{ matrix.archive }}" omp-relayd
+          sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-${{ matrix.target }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish npm package and GitHub release
+    needs: [security, build-relay]
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install locked development dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify release identity
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const cargo = fs.readFileSync("relayd/Cargo.toml", "utf8");
+          const cargoVersion = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+          const tag = process.env.GITHUB_REF_NAME;
+          if (tag !== `v${pkg.version}`) throw new Error(`tag ${tag} must exactly equal v${pkg.version}`);
+          if (!/^\d+\.\d+\.\d+$/.test(pkg.version)) throw new Error(`stable release requires plain semver: ${pkg.version}`);
+          if (cargoVersion !== pkg.version) throw new Error(`Cargo version ${cargoVersion} does not match npm version ${pkg.version}`);
+          NODE
+
+      - name: Verify source and package contracts
+        run: bun run verify
+
+      - name: Install packed plugin as an OMP plugin
+        run: |
+          TARBALL="$(npm pack --json | node -e 'let text=""; process.stdin.on("data", chunk => text += chunk).on("end", () => process.stdout.write(JSON.parse(text)[0].filename))')"
+          mkdir -p "$RUNNER_TEMP/package"
+          tar -xzf "$GITHUB_WORKSPACE/$TARBALL" -C "$RUNNER_TEMP/package"
+          export HOME="$RUNNER_TEMP/omp-home"
+          export PATH="$GITHUB_WORKSPACE/node_modules/.bin:$PATH"
+          omp plugin install "$RUNNER_TEMP/package/package"
+          omp plugin doctor
+
+      - name: Setup Node with npm registry auth
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: relay-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub release with binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release-assets/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

@@ -1,0 +1,62 @@
+{
+	"name": "omp-relay",
+	"version": "0.1.0",
+	"description": "Authenticated OMP forward relay for geo-restricted providers and simple traffic rerouting",
+	"keywords": [
+		"oh-my-pi",
+		"omp",
+		"ai",
+		"proxy",
+		"relay",
+		"geoip",
+		"forward-proxy"
+	],
+	"homepage": "https://github.com/DarkPhilosophy/omp-relay#readme",
+	"bugs": {
+		"url": "https://github.com/DarkPhilosophy/omp-relay/issues"
+	},
+	"author": "DarkPhilosophy",
+	"license": "GPL-3.0-or-later",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/DarkPhilosophy/omp-relay.git"
+	},
+	"engines": {
+		"bun": ">=1.2.0"
+	},
+	"exports": "./src/index.ts",
+	"omp": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"files": [
+		"src",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"check": "bun run typecheck && bun run lint && bun run test && bun run test:rust && bun run test:mode && bun run scan && bun run package:check",
+		"format": "biome format --write .",
+		"format:check": "biome format .",
+		"lint": "biome check .",
+		"typecheck": "tsc --noEmit",
+		"test": "bun test",
+		"test:rust": "cargo test --manifest-path relayd/Cargo.toml",
+		"build:relay": "cargo build --manifest-path relayd/Cargo.toml --release",
+		"test:mode": "bun .scripts/test-mode.mjs",
+		"scan": "bun .scripts/scan-leaks.mjs",
+		"package:check": "bun .scripts/verify-package.mjs",
+		"verify": "bun run check && cargo fmt --manifest-path relayd/Cargo.toml --check && cargo clippy --manifest-path relayd/Cargo.toml --all-targets -- -D warnings && bun run build:relay"
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-coding-agent": ">=18.0.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.2.2",
+		"@oh-my-pi/pi-coding-agent": ">=18.0.0",
+		"@types/bun": "latest",
+		"typescript": "^5.9.2"
+	}
+}
