@@ -278,12 +278,18 @@ fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn prepare_registry_directory(registry: &Path) -> std::io::Result<()> {
-    let Some(parent) = registry.parent() else {
+    let Some(parent) = registry
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
         return Ok(());
     };
+    // Only tighten permissions on a directory we create ourselves; an existing
+    // parent (for example a shared or user-managed directory) keeps its mode.
+    let newly_created = !parent.exists();
     std::fs::create_dir_all(parent)?;
     #[cfg(unix)]
-    {
+    if newly_created {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
@@ -745,5 +751,41 @@ mod tests {
                 action: ServiceAction::Status
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_registry_directory_preserves_existing_parent_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = std::env::temp_dir().join(format!("omp-relay-prep-{}", std::process::id()));
+        let shared = base.join("shared");
+        std::fs::create_dir_all(&shared).expect("shared parent created");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o750))
+            .expect("shared parent mode set");
+        prepare_registry_directory(&shared.join("registry.json"))
+            .expect("existing parent is accepted");
+        let mode = std::fs::metadata(&shared)
+            .expect("shared metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o750, "existing parent mode must be preserved");
+        std::fs::remove_dir_all(&base).expect("temporary tree removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_registry_directory_tightens_new_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = std::env::temp_dir().join(format!("omp-relay-prep-new-{}", std::process::id()));
+        let created = base.join("state");
+        prepare_registry_directory(&created.join("registry.json")).expect("new parent is created");
+        let mode = std::fs::metadata(&created)
+            .expect("state metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "newly created parent must be private");
+        std::fs::remove_dir_all(&base).expect("temporary tree removed");
     }
 }

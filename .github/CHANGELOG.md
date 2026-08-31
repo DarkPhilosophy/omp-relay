@@ -26,6 +26,7 @@ All notable changes to omp-relay are documented here.
 
 - Revoked clients now lose access without being restored by a stale in-memory registry snapshot.
 - `last_seen` values are written durably with bounded write frequency.
+- `service install` only tightens permissions on a registry parent directory it creates; an existing directory keeps its mode.
 - Unix shutdown handling now responds correctly to both SIGINT and SIGTERM.
 
 ## 0.1.0 - 2026-08-31
