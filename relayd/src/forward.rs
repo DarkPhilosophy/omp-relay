@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{net::{IpAddr, SocketAddr}, sync::Arc, time::Instant};
 
 use axum::{
     body::Body,
@@ -78,13 +78,24 @@ async fn connect_tunnel(
     let Some(authority) = request.uri().authority().map(ToString::to_string) else {
         return (StatusCode::BAD_REQUEST, "CONNECT target missing").into_response();
     };
+    let parsed = match authority.parse::<http::uri::Authority>() {
+        Ok(value) => value,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid CONNECT target").into_response(),
+    };
+    let Some(port) = parsed.port_u16() else {
+        return (StatusCode::BAD_REQUEST, "CONNECT target port missing").into_response();
+    };
+    let addresses = match resolve_public_target(parsed.host(), port).await {
+        Ok(addresses) => addresses,
+        Err(response) => return response,
+    };
     let started = Instant::now();
     let state_for_upgrade = state.clone();
     let authority_for_upgrade = authority.clone();
     tokio::spawn(async move {
         let _guard = state_for_upgrade.stream_guard();
         match hyper::upgrade::on(&mut request).await {
-            Ok(client) => match tokio::net::TcpStream::connect(&authority_for_upgrade).await {
+            Ok(client) => match connect_any(&addresses).await {
                 Ok(mut upstream) => {
                     let mut client = TokioIo::new(client);
                     if let Err(error) = copy_bidirectional(&mut client, &mut upstream).await {
@@ -116,6 +127,19 @@ async fn forward_http(
     let uri = request.uri().clone();
     if uri.scheme().is_none() || uri.authority().is_none() {
         return (StatusCode::BAD_REQUEST, "absolute proxy URI required").into_response();
+    }
+    let Some(host) = uri.host() else {
+        return (StatusCode::BAD_REQUEST, "proxy target host missing").into_response();
+    };
+    let port = uri.port_u16().unwrap_or_else(|| {
+        if uri.scheme_str().is_some_and(|scheme| scheme.eq_ignore_ascii_case("https")) {
+            443
+        } else {
+            80
+        }
+    });
+    if let Err(response) = resolve_public_target(host, port).await {
+        return response;
     }
     let method = request.method().clone();
     let (parts, body) = request.into_parts();
@@ -156,6 +180,71 @@ async fn forward_http(
     response
 }
 
+async fn resolve_public_target(host: &str, port: u16) -> Result<Vec<SocketAddr>, Response> {
+    let normalized = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if normalized == "localhost"
+        || normalized.ends_with(".localhost")
+        || normalized == "metadata.google.internal"
+    {
+        return Err(target_forbidden());
+    }
+    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| {
+            (StatusCode::BAD_GATEWAY, format!("target resolution failed: {error}")).into_response()
+        })?
+        .collect();
+    if addresses.is_empty() {
+        return Err((StatusCode::BAD_GATEWAY, "target resolved to no addresses").into_response());
+    }
+    if addresses.iter().any(|address| is_disallowed_ip(address.ip())) {
+        return Err(target_forbidden());
+    }
+    Ok(addresses)
+}
+
+async fn connect_any(addresses: &[SocketAddr]) -> std::io::Result<tokio::net::TcpStream> {
+    let mut last_error = None;
+    for address in addresses {
+        match tokio::net::TcpStream::connect(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("target resolved to no addresses")))
+}
+
+fn target_forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "proxy target is not allowed: loopback, private, link-local, metadata, and other non-public destinations are blocked",
+    )
+        .into_response()
+}
+
+fn is_disallowed_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+    }
+}
+
 fn is_proxy_or_hop_header(name: &axum::http::HeaderName) -> bool {
     matches!(
         name.as_str().to_ascii_lowercase().as_str(),
@@ -173,3 +262,32 @@ fn is_proxy_or_hop_header(name: &axum::http::HeaderName) -> bool {
 
 #[allow(dead_code)]
 fn _assert_uri_send(_: Uri) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn rejects_non_public_ipv4_ranges() {
+        for ip in [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(169, 254, 169, 254),
+            Ipv4Addr::new(100, 64, 0, 1),
+        ] {
+            assert!(is_disallowed_ip(IpAddr::V4(ip)), "{ip} should be blocked");
+        }
+        assert!(!is_disallowed_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn rejects_non_public_ipv6_ranges() {
+        assert!(is_disallowed_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_disallowed_ip(IpAddr::V6("fd00::1".parse().expect("ULA parses"))));
+        assert!(is_disallowed_ip(IpAddr::V6("fe80::1".parse().expect("link-local parses"))));
+        assert!(!is_disallowed_ip(IpAddr::V6("2606:4700:4700::1111".parse().expect("public IPv6 parses"))));
+    }
+}
