@@ -429,7 +429,7 @@ async fn shutdown_signal() {
             .expect("failed to install SIGTERM handler")
             .recv()
             .await;
-    }
+    };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
