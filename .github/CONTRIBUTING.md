@@ -6,7 +6,7 @@ Thanks for looking at omp-relay! Small, focused PRs are the easiest to review.
 
 1. **Preserve the transport boundary.** OMP chooses the provider destination; the relay forwards that exact destination. Do not add static provider routing or inspect request bodies.
 2. **Keep credentials private.** Pairing tokens, proxy credentials, request bodies, and authorization headers must never appear in logs, fixtures, issues, or commits.
-3. **Keep responsibilities separated.** `src/index.ts` owns the OMP extension; `relayd/src/forward.rs` owns the standard forward proxy; legacy relay routes stay isolated from forward-proxy transport.
+3. **Keep responsibilities separated.** `src/index.ts` owns the OMP extension; `relayd/src/forward.rs` owns the standard forward proxy and CONNECT transport.
 4. **Tests before behavior.** Extension changes need focused Bun tests under `tests/`; relay changes need Rust tests and the deterministic `self-test` path.
 
 ## Workflow

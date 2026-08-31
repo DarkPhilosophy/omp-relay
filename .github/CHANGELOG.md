@@ -16,6 +16,7 @@ All notable changes to omp-relay are documented here.
 - Reuse pinned HTTP clients for stable upstream connections while refreshing them when DNS answers change.
 - Move registry file access away from asynchronous worker threads and serialize registry updates with file locks.
 - Persist registry updates through atomic replacement and keep registry and lock files private to the current user on Unix.
+- Remove the obsolete host-in-path relay routes and WebSocket bridge, closing the legacy SSRF bypass and keeping one hardened forward-proxy transport.
 
 ### Fixed
 

@@ -1,7 +1,5 @@
 mod forward;
-mod proxy;
 mod registry;
-mod ws;
 
 use std::{
     collections::HashMap,
@@ -11,7 +9,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use axum::{
@@ -98,7 +96,6 @@ pub struct AppState {
     debug: AtomicBool,
     active_streams: AtomicUsize,
     pair_attempts: Mutex<HashMap<IpAddr, PairRateWindow>>,
-    http_client: reqwest::Client,
     pinned_clients: Mutex<HashMap<String, PinnedHttpClient>>,
 }
 #[derive(Clone)]
@@ -365,17 +362,12 @@ async fn serve(path: PathBuf, bind: SocketAddr) -> Result<(), Box<dyn std::error
         debug: AtomicBool::new(false),
         active_streams: AtomicUsize::new(0),
         pair_attempts: Mutex::new(HashMap::new()),
-        http_client: reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .build()?,
         pinned_clients: Mutex::new(HashMap::new()),
     });
     let app = Router::new()
         .route("/pair", post(pair))
         .route("/status", get(status))
         .route("/debug", post(debug))
-        .route("/t/{uuid}/{host}/{*rest}", any(proxy::proxy))
-        .route("/t/{uuid}/{host}", any(proxy::proxy_root))
         .fallback(any(forward::forward_proxy))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(bind).await?;

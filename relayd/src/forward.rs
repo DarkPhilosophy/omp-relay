@@ -416,7 +416,6 @@ mod tests {
             debug: std::sync::atomic::AtomicBool::new(false),
             active_streams: std::sync::atomic::AtomicUsize::new(0),
             pair_attempts: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            http_client: reqwest::Client::new(),
             pinned_clients: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }

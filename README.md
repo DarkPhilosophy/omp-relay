@@ -186,9 +186,7 @@ CI artifacts are temporary build evidence only. User-facing binaries are attache
 ```text
 src/index.ts          OMP extension: commands, proxy environment, health widget
 relayd/src/forward.rs HTTP forward proxy and CONNECT tunnelling
-relayd/src/proxy.rs   Legacy HTTP/SSE and WebSocket routes
 relayd/src/registry.rs Pairing and client registry
-relayd/src/ws.rs      WebSocket bridge
 tests/                Bun extension tests
 .scripts/             Leak scan, package checks, and test-mode launcher
 .github/workflows/    CI and stable-release automation
