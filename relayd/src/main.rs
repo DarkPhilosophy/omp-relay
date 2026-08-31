@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use registry::{Registry, registry_path, token_hash, unix_time};
+use registry::{Registry, registry_lock, registry_path, token_hash, unix_time};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -69,8 +69,6 @@ pub struct AuthenticatedClient {
 pub struct AppState {
     registry_path: PathBuf,
     registry: RwLock<Registry>,
-    dirty_last_seen: AtomicBool,
-    last_seen_flush: AtomicU64,
     started: Instant,
     debug: AtomicBool,
     active_streams: AtomicUsize,
@@ -95,20 +93,6 @@ impl AppState {
     fn stream_guard(&self) -> StreamGuard<'_> {
         self.active_streams.fetch_add(1, Ordering::Relaxed);
         StreamGuard(&self.active_streams)
-    }
-
-    async fn flush_last_seen_if_due(&self, force: bool) -> std::io::Result<()> {
-        if !self.dirty_last_seen.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let now = unix_time();
-        if !force && now.saturating_sub(self.last_seen_flush.load(Ordering::Relaxed)) < 60 {
-            return Ok(());
-        }
-        self.registry.read().await.save(&self.registry_path)?;
-        self.last_seen_flush.store(now, Ordering::Relaxed);
-        self.dirty_last_seen.store(false, Ordering::Relaxed);
-        Ok(())
     }
 }
 
@@ -146,12 +130,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Serve { bind } => serve(path, bind).await?,
         Command::Pair => {
+            let _lock = registry_lock(&path)?;
             let mut registry = Registry::load(&path)?;
             let code = registry.create_pairing_code(unix_time());
             registry.save(&path)?;
             println!("{code}");
         }
         Command::List => {
+            let _lock = registry_lock(&path)?;
             let registry = Registry::load(&path)?;
             if registry.clients.is_empty() {
                 println!("No paired clients.");
@@ -166,6 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Revoke { uuid } => {
+            let _lock = registry_lock(&path)?;
             let mut registry = Registry::load(&path)?;
             if !registry.revoke(uuid) {
                 return Err(format!("client {uuid} not found").into());
@@ -207,12 +194,13 @@ fn self_test() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn serve(path: PathBuf, bind: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = Registry::load(&path)?;
+    let registry = {
+        let _lock = registry_lock(&path)?;
+        Registry::load(&path)?
+    };
     let state = Arc::new(AppState {
         registry_path: path,
         registry: RwLock::new(registry),
-        dirty_last_seen: AtomicBool::new(false),
-        last_seen_flush: AtomicU64::new(unix_time()),
         started: Instant::now(),
         debug: AtomicBool::new(false),
         active_streams: AtomicUsize::new(0),
@@ -237,7 +225,6 @@ async fn serve(path: PathBuf, bind: SocketAddr) -> Result<(), Box<dyn std::error
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
-    state.flush_last_seen_if_due(true).await?;
     Ok(())
 }
 
@@ -253,18 +240,6 @@ async fn pair(
         )
             .into_response();
     }
-    let now = unix_time();
-    let mut registry = match Registry::load(&state.registry_path) {
-        Ok(registry) => registry,
-        Err(error) => return internal_error(error),
-    };
-    if !registry.consume_pairing_code(&request.code, now) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "invalid_or_expired_code" })),
-        )
-            .into_response();
-    }
     let name = request.name.trim();
     if name.is_empty() || name.len() > 128 {
         return (
@@ -273,10 +248,31 @@ async fn pair(
         )
             .into_response();
     }
-    let (uuid, token) = registry.add_client(name.to_owned(), now);
-    if let Err(error) = registry.save(&state.registry_path) {
-        return internal_error(error);
-    }
+    let now = unix_time();
+    let result = (|| -> std::io::Result<(Registry, Uuid, String)> {
+        let _lock = registry_lock(&state.registry_path)?;
+        let mut registry = Registry::load(&state.registry_path)?;
+        if !registry.consume_pairing_code(&request.code, now) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid_or_expired_code",
+            ));
+        }
+        let (uuid, token) = registry.add_client(name.to_owned(), now);
+        registry.save(&state.registry_path)?;
+        Ok((registry, uuid, token))
+    })();
+    let (registry, uuid, token) = match result {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "invalid_or_expired_code" })),
+            )
+                .into_response();
+        }
+        Err(error) => return internal_error(error),
+    };
     *state.registry.write().await = registry;
     (StatusCode::OK, Json(PairResponse { uuid, token })).into_response()
 }
@@ -346,27 +342,10 @@ pub async fn authenticate_token(
             .into_response());
     };
     let presented_hash = token_hash(token);
-    {
-        let registry = state.registry.read().await;
-        if let Some(client) = registry.clients.iter().find(|client| client.uuid == uuid) {
-            if constant_time_equal(client.token_sha256.as_bytes(), presented_hash.as_bytes()) {
-                let authenticated = AuthenticatedClient {
-                    uuid,
-                    name: client.name.clone(),
-                };
-                drop(registry);
-                touch_last_seen(state, uuid).await;
-                return Ok(authenticated);
-            }
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "unauthorized" })),
-            )
-                .into_response());
-        }
-    }
-
-    let disk_registry = Registry::load(&state.registry_path).map_err(internal_error)?;
+    let disk_registry = {
+        let _lock = registry_lock(&state.registry_path).map_err(internal_error)?;
+        Registry::load(&state.registry_path).map_err(internal_error)?
+    };
     let authenticated = disk_registry
         .clients
         .iter()
@@ -401,10 +380,6 @@ async fn touch_last_seen(state: &AppState, uuid: Uuid) {
         .find(|client| client.uuid == uuid)
     {
         client.last_seen = now;
-        state.dirty_last_seen.store(true, Ordering::Relaxed);
-    }
-    if let Err(error) = state.flush_last_seen_if_due(false).await {
-        tracing::warn!(%error, "failed to flush last_seen timestamps");
     }
 }
 
