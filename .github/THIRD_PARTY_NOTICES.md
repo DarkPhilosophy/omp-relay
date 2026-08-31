@@ -9,4 +9,4 @@ Rust crates
 Bun, Biome, TypeScript, and OMP type definitions
 - Use: development, testing, formatting, and extension type-checking. They are not bundled in the npm package.
 
-This package bundles no third-party code. Development dependencies (Biome, TypeScript, Bun types) are not distributed.
+The npm package does not bundle third-party source code or development dependencies. The standalone `omp-relayd` binaries statically link their Rust dependencies under the licenses recorded by the corresponding crates.
