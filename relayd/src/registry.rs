@@ -1,9 +1,12 @@
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     io::{self, ErrorKind},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
@@ -31,6 +34,30 @@ pub struct Registry {
     pub codes: Vec<PairingCode>,
 }
 
+pub struct RegistryLock(File);
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "failed to unlock relay registry");
+        }
+    }
+}
+
+pub fn registry_lock(path: &Path) -> io::Result<RegistryLock> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(lock_path)?;
+    file.lock()?;
+    Ok(RegistryLock(file))
+}
+
 impl Registry {
     pub fn load(path: &Path) -> io::Result<Self> {
         match fs::read(path) {
@@ -47,7 +74,14 @@ impl Registry {
         }
         let temporary = path.with_extension(format!("json.tmp-{}", Uuid::new_v4()));
         let data = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        fs::write(&temporary, data)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
+        use std::io::Write as _;
+        file.write_all(&data)?;
+        file.sync_all()?;
         fs::rename(&temporary, path)?;
         Ok(())
     }
@@ -180,11 +214,31 @@ mod tests {
         let mut registry = Registry::default();
         registry.add_client("atv".to_owned(), 1_000);
 
+        let _lock = registry_lock(&path).expect("registry lock is acquired");
         registry.save(&path).expect("registry saves");
         let loaded = Registry::load(&path).expect("registry loads");
 
         assert_eq!(loaded.clients.len(), 1);
         assert_eq!(loaded.clients[0].name, "atv");
+        drop(_lock);
+        fs::remove_dir_all(directory).expect("temporary registry directory is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!("omp-relayd-mode-test-{}", Uuid::new_v4()));
+        let path = directory.join("registry.json");
+        let registry = Registry::default();
+        let lock = registry_lock(&path).expect("registry lock is acquired");
+        registry.save(&path).expect("registry saves");
+
+        assert_eq!(fs::metadata(&path).expect("registry metadata").permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(path.with_extension("lock")).expect("lock metadata").permissions().mode() & 0o777, 0o600);
+
+        drop(lock);
         fs::remove_dir_all(directory).expect("temporary registry directory is removed");
     }
 }
