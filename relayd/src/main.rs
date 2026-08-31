@@ -22,7 +22,7 @@ use axum::{
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -71,7 +71,7 @@ enum Command {
 enum ServiceAction {
     /// Write a systemd user unit, then enable and start it.
     Install {
-        #[arg(long, default_value = "0.0.0.0:8787")]
+        #[arg(long)]
         bind: SocketAddr,
         /// Write the unit file only; do not enable or start the service.
         #[arg(long)]
@@ -91,7 +91,6 @@ pub struct AuthenticatedClient {
 
 pub struct AppState {
     registry_path: PathBuf,
-    registry: RwLock<Registry>,
     started: Instant,
     debug: AtomicBool,
     active_streams: AtomicUsize,
@@ -351,13 +350,12 @@ fn systemctl<const N: usize>(args: [&str; N]) -> Result<(), Box<dyn std::error::
 }
 
 async fn serve(path: PathBuf, bind: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = {
+    {
         let _lock = registry_read_lock(&path)?;
-        Registry::load(&path)?
-    };
+        Registry::load(&path)?;
+    }
     let state = Arc::new(AppState {
         registry_path: path,
-        registry: RwLock::new(registry),
         started: Instant::now(),
         debug: AtomicBool::new(false),
         active_streams: AtomicUsize::new(0),
@@ -422,7 +420,6 @@ async fn pair(
         return internal_error(error);
     }
     drop(lock);
-    *state.registry.write().await = registry;
     (StatusCode::OK, Json(PairResponse { uuid, token })).into_response()
 }
 
@@ -430,7 +427,17 @@ async fn status(State(state): State<Arc<AppState>>, request: Request) -> Respons
     if let Err(response) = authenticate(&state, request.headers()).await {
         return response;
     }
-    let clients = state.registry.read().await.clients.len();
+    let registry_path = state.registry_path.clone();
+    let clients = match tokio::task::spawn_blocking(move || {
+        let _lock = registry_read_lock(&registry_path)?;
+        Registry::load(&registry_path).map(|registry| registry.clients.len())
+    })
+    .await
+    {
+        Ok(Ok(clients)) => clients,
+        Ok(Err(error)) => return internal_error(error),
+        Err(error) => return internal_error(format!("registry status task failed: {error}")),
+    };
     Json(json!({
         "version": VERSION,
         "uptime_s": state.started.elapsed().as_secs(),
@@ -493,13 +500,12 @@ pub async fn authenticate_token(
     let presented_hash = token_hash(token);
     let registry_path = state.registry_path.clone();
     let now = unix_time();
-    let (name, disk_registry) = tokio::task::spawn_blocking(move || {
+    let (name, _disk_registry) = tokio::task::spawn_blocking(move || {
         authenticate_disk(&registry_path, uuid, &presented_hash, now)
     })
     .await
     .map_err(|error| internal_error(format!("registry auth task failed: {error}")))?
     .map_err(internal_error)?;
-    *state.registry.write().await = disk_registry;
     let Some(name) = name else {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -515,6 +521,21 @@ fn authenticate_disk(
     presented_hash: &str,
     now: u64,
 ) -> std::io::Result<(Option<String>, Registry)> {
+    let read_lock = registry_read_lock(path)?;
+    let registry = Registry::load(path)?;
+    let Some(client) = registry.clients.iter().find(|client| {
+        client.uuid == uuid
+            && constant_time_equal(client.token_sha256.as_bytes(), presented_hash.as_bytes())
+    }) else {
+        return Ok((None, registry));
+    };
+    let name = client.name.clone();
+    let should_flush = now.saturating_sub(client.last_seen) >= LAST_SEEN_FLUSH_SECS;
+    drop(read_lock);
+    if !should_flush {
+        return Ok((Some(name), registry));
+    }
+
     let _lock = registry_lock(path)?;
     let mut registry = Registry::load(path)?;
     let Some(client) = registry.clients.iter_mut().find(|client| {
@@ -635,6 +656,53 @@ mod tests {
         std::fs::remove_dir_all(path.parent().expect("registry parent exists"))
             .expect("temporary registry is removed");
     }
+    #[test]
+    fn concurrent_authentication_never_revives_revoked_clients() {
+        let path = temporary_registry();
+        let mut registry = Registry::default();
+        let created = 1_000;
+        let (uuid, token) = registry.add_client("concurrent client".into(), created);
+        registry.save(&path).expect("registry saves");
+        let token_hash = token_hash(&token);
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let path = path.clone();
+            let token_hash = token_hash.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                authenticate_disk(
+                    &path,
+                    uuid,
+                    &token_hash,
+                    created + LAST_SEEN_FLUSH_SECS + index,
+                )
+                .expect("concurrent authentication completes");
+            }));
+        }
+
+        barrier.wait();
+        {
+            let _lock = registry_lock(&path).expect("registry locks for revocation");
+            let mut registry = Registry::load(&path).expect("registry reloads for revocation");
+            assert!(registry.revoke(uuid));
+            registry.save(&path).expect("revocation saves");
+        }
+        for worker in workers {
+            worker.join().expect("authentication worker joins");
+        }
+
+        let (name, registry) =
+            authenticate_disk(&path, uuid, &token_hash, created + LAST_SEEN_FLUSH_SECS * 2)
+                .expect("post-revocation authentication is handled");
+        assert!(name.is_none());
+        assert!(registry.clients.is_empty());
+
+        std::fs::remove_dir_all(path.parent().expect("registry parent exists"))
+            .expect("temporary registry is removed");
+    }
 
     #[test]
     fn service_unit_quotes_paths_and_applies_sandboxing() {
@@ -653,9 +721,16 @@ mod tests {
     }
 
     #[test]
-    fn service_actions_are_direct_subcommands() {
-        let install = Cli::try_parse_from(["omp-relayd", "service", "install"])
-            .expect("service install parses");
+    fn service_actions_are_direct_subcommands_and_install_requires_bind() {
+        assert!(Cli::try_parse_from(["omp-relayd", "service", "install"]).is_err());
+        let install = Cli::try_parse_from([
+            "omp-relayd",
+            "service",
+            "install",
+            "--bind",
+            "10.90.0.2:43118",
+        ])
+        .expect("service install with explicit bind parses");
         assert!(matches!(
             install.command,
             Command::Service {

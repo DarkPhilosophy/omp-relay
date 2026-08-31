@@ -75,6 +75,8 @@ fn proxy_auth_required() -> Response {
     response
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn connect_tunnel(
     state: Arc<AppState>,
     peer: SocketAddr,
@@ -96,22 +98,29 @@ async fn connect_tunnel(
         Err(error) => return target_error_response(error),
     };
     let started = Instant::now();
+    let upstream = match tokio::time::timeout(CONNECT_TIMEOUT, connect_any(&addresses)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, target = %authority, "CONNECT upstream failed");
+            return (StatusCode::BAD_GATEWAY, "CONNECT upstream failed").into_response();
+        }
+        Err(_) => {
+            tracing::warn!(target = %authority, "CONNECT upstream timed out");
+            return (StatusCode::GATEWAY_TIMEOUT, "CONNECT upstream timed out").into_response();
+        }
+    };
     let state_for_upgrade = state.clone();
     let authority_for_upgrade = authority.clone();
     tokio::spawn(async move {
         let _guard = state_for_upgrade.stream_guard();
         match hyper::upgrade::on(&mut request).await {
-            Ok(client) => match connect_any(&addresses).await {
-                Ok(mut upstream) => {
-                    let mut client = TokioIo::new(client);
-                    if let Err(error) = copy_bidirectional(&mut client, &mut upstream).await {
-                        tracing::debug!(%error, target = %authority_for_upgrade, "CONNECT tunnel closed with I/O error");
-                    }
+            Ok(client) => {
+                let mut client = TokioIo::new(client);
+                let mut upstream = upstream;
+                if let Err(error) = copy_bidirectional(&mut client, &mut upstream).await {
+                    tracing::debug!(%error, target = %authority_for_upgrade, "CONNECT tunnel closed with I/O error");
                 }
-                Err(error) => {
-                    tracing::warn!(%error, target = %authority_for_upgrade, "CONNECT upstream failed")
-                }
-            },
+            }
             Err(error) => {
                 tracing::warn!(%error, target = %authority_for_upgrade, "CONNECT upgrade failed")
             }
@@ -121,6 +130,37 @@ async fn connect_tunnel(
         tracing::info!(client = %authenticated.uuid, client_name = %authenticated.name, peer = %peer.ip(), target = %authority, duration_ms = started.elapsed().as_millis(), "opened CONNECT tunnel");
     }
     StatusCode::OK.into_response()
+}
+
+struct DebugTarget<'a> {
+    scheme: &'a str,
+    host: &'a str,
+    port: u16,
+}
+
+impl DebugTarget<'_> {
+    fn from_uri(uri: &Uri) -> Option<DebugTarget<'_>> {
+        let scheme = uri.scheme_str()?;
+        let host = uri.host()?;
+        let port = uri.port_u16().unwrap_or_else(|| {
+            if scheme.eq_ignore_ascii_case("https") {
+                443
+            } else {
+                80
+            }
+        });
+        Some(DebugTarget { scheme, host, port })
+    }
+}
+
+impl std::fmt::Display for DebugTarget<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(formatter, "{}://[{}]:{}", self.scheme, self.host, self.port)
+        } else {
+            write!(formatter, "{}://{}:{}", self.scheme, self.host, self.port)
+        }
+    }
 }
 
 async fn forward_http(
@@ -195,7 +235,8 @@ async fn forward_http(
         response.headers_mut().append(name, value);
     }
     if state.debug.load(std::sync::atomic::Ordering::Relaxed) {
-        tracing::info!(client = %authenticated.uuid, client_name = %authenticated.name, peer = %peer.ip(), method = %method, target = %uri, status = %status, duration_ms = started.elapsed().as_millis(), "proxied absolute HTTP request");
+        let target = DebugTarget::from_uri(&uri).expect("validated absolute proxy URI");
+        tracing::info!(client = %authenticated.uuid, client_name = %authenticated.name, peer = %peer.ip(), method = %method, target = %target, status = %status, duration_ms = started.elapsed().as_millis(), "proxied absolute HTTP request");
     }
     response
 }
@@ -306,31 +347,56 @@ fn target_error_response(error: TargetError) -> Response {
 }
 
 fn is_disallowed_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => is_disallowed_ipv4(ip),
-        IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return is_disallowed_ipv4(mapped);
-            }
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-        }
+    !match ip {
+        IpAddr::V4(ip) => is_globally_routable_ipv4(ip),
+        IpAddr::V6(ip) => is_globally_routable_ipv6(ip),
     }
 }
 
-fn is_disallowed_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
+fn is_globally_routable_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !matches!(
+        (a, b, c),
+        (0, _, _)
+            | (10, _, _)
+            | (127, _, _)
+            | (100, 64..=127, _)
+            | (169, 254, _)
+            | (172, 16..=31, _)
+            | (192, 168, _)
+            | (192, 0, 0)
+            | (192, 0, 2)
+            | (192, 88, 99)
+            | (198, 18..=19, _)
+            | (198, 51, 100)
+            | (203, 0, 113)
+            | (224..=255, _, _)
+    )
+}
+
+fn is_globally_routable_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    // IPv4-mapped destinations (::ffff:a.b.c.d) follow the IPv4 policy.
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return is_globally_routable_ipv4(mapped);
+    }
+    // IANA allocates global IPv6 unicast from 2000::/3. Everything outside it,
+    // plus special-purpose blocks inside it, must stay unreachable.
+    if ip.segments()[0] & 0xe000 != 0x2000
         || ip.is_multicast()
-        || octets[0] == 0
-        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+    {
+        return false;
+    }
+    let s = ip.segments();
+    // Teredo (2001::/32), benchmarking (2001:2::/48), ORCHIDv2 (2001:20::/28),
+    // documentation (2001:db8::/32, 3fff::/20), and deprecated 6to4 (2002::/16).
+    !((s[0] == 0x2001 && s[1] == 0x0000)
+        || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0x0000)
+        || (s[0] == 0x2001 && (0x0020..=0x002f).contains(&s[1]))
+        || (s[0] == 0x2001 && s[1] == 0x0db8)
+        || s[0] == 0x2002
+        || (s[0] == 0x3fff && s[1] & 0xf000 == 0x0000))
 }
 
 fn is_proxy_or_hop_header(name: &axum::http::HeaderName) -> bool {
@@ -372,6 +438,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_reserved_and_documentation_ipv4_ranges() {
+        for ip in [
+            Ipv4Addr::new(192, 0, 2, 1),
+            Ipv4Addr::new(198, 51, 100, 1),
+            Ipv4Addr::new(203, 0, 113, 1),
+            Ipv4Addr::new(198, 18, 0, 1),
+            Ipv4Addr::new(192, 88, 99, 1),
+            Ipv4Addr::new(240, 0, 0, 1),
+            Ipv4Addr::new(255, 255, 255, 255),
+        ] {
+            assert!(is_disallowed_ip(IpAddr::V4(ip)), "{ip} should be blocked");
+        }
+        assert!(!is_disallowed_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+    }
+
+    #[test]
+    fn rejects_special_purpose_ipv6_ranges() {
+        for ip in [
+            "2001:db8::1",
+            "2002:c000:0204::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:20::1",
+            "3fff::1",
+            "0100::1",
+        ] {
+            let parsed: Ipv6Addr = ip.parse().expect("IPv6 parses");
+            assert!(
+                is_disallowed_ip(IpAddr::V6(parsed)),
+                "{ip} should be blocked"
+            );
+        }
+        assert!(!is_disallowed_ip(IpAddr::V6(
+            "2001:4860:4860::8888".parse().expect("public IPv6 parses")
+        )));
+    }
+
+    #[test]
     fn rejects_non_public_ipv6_ranges() {
         assert!(is_disallowed_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         assert!(is_disallowed_ip(IpAddr::V6(
@@ -402,6 +506,21 @@ mod tests {
     }
 
     #[test]
+    fn debug_target_excludes_path_query_and_fragment_secrets() {
+        let uri: Uri = "https://api.example.com:8443/v1/chat?api_key=secret-token#private"
+            .parse()
+            .expect("absolute URI parses");
+        let rendered = DebugTarget::from_uri(&uri)
+            .expect("debug target parses")
+            .to_string();
+
+        assert_eq!(rendered, "https://api.example.com:8443");
+        assert!(!rendered.contains("/v1/chat"));
+        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("private"));
+    }
+
+    #[test]
     fn pinned_client_accepts_validated_addresses_for_http_and_https_hosts() {
         let addresses = [SocketAddr::from(([93, 184, 216, 34], 443))];
         assert!(pinned_http_client("example.com", &addresses).is_ok());
@@ -411,7 +530,6 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             registry_path: std::path::PathBuf::new(),
-            registry: tokio::sync::RwLock::new(crate::registry::Registry::default()),
             started: Instant::now(),
             debug: std::sync::atomic::AtomicBool::new(false),
             active_streams: std::sync::atomic::AtomicUsize::new(0),
