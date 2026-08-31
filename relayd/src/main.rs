@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use registry::{Registry, registry_lock, registry_path, token_hash, unix_time};
+use registry::{Registry, registry_lock, registry_path, registry_read_lock, token_hash, unix_time};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{code}");
         }
         Command::List => {
-            let _lock = registry_lock(&path)?;
+            let _lock = registry_read_lock(&path)?;
             let registry = Registry::load(&path)?;
             if registry.clients.is_empty() {
                 println!("No paired clients.");
@@ -195,7 +195,7 @@ fn self_test() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn serve(path: PathBuf, bind: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let registry = {
-        let _lock = registry_lock(&path)?;
+        let _lock = registry_read_lock(&path)?;
         Registry::load(&path)?
     };
     let state = Arc::new(AppState {
@@ -338,10 +338,14 @@ pub async fn authenticate_token(
             .into_response());
     };
     let presented_hash = token_hash(token);
-    let disk_registry = {
-        let _lock = registry_lock(&state.registry_path).map_err(internal_error)?;
-        Registry::load(&state.registry_path).map_err(internal_error)?
-    };
+    let registry_path = state.registry_path.clone();
+    let disk_registry = tokio::task::spawn_blocking(move || {
+        let _lock = registry_read_lock(&registry_path)?;
+        Registry::load(&registry_path)
+    })
+    .await
+    .map_err(|error| internal_error(format!("registry read task failed: {error}")))?
+    .map_err(internal_error)?;
     let authenticated = disk_registry
         .clients
         .iter()
