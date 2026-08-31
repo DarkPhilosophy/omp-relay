@@ -249,30 +249,26 @@ async fn pair(
             .into_response();
     }
     let now = unix_time();
-    let result = (|| -> std::io::Result<(Registry, Uuid, String)> {
-        let _lock = registry_lock(&state.registry_path)?;
-        let mut registry = Registry::load(&state.registry_path)?;
-        if !registry.consume_pairing_code(&request.code, now) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "invalid_or_expired_code",
-            ));
-        }
-        let (uuid, token) = registry.add_client(name.to_owned(), now);
-        registry.save(&state.registry_path)?;
-        Ok((registry, uuid, token))
-    })();
-    let (registry, uuid, token) = match result {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "invalid_or_expired_code" })),
-            )
-                .into_response();
-        }
+    let lock = match registry_lock(&state.registry_path) {
+        Ok(lock) => lock,
         Err(error) => return internal_error(error),
     };
+    let mut registry = match Registry::load(&state.registry_path) {
+        Ok(registry) => registry,
+        Err(error) => return internal_error(error),
+    };
+    if !registry.consume_pairing_code(&request.code, now) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "invalid_or_expired_code" })),
+        )
+            .into_response();
+    }
+    let (uuid, token) = registry.add_client(name.to_owned(), now);
+    if let Err(error) = registry.save(&state.registry_path) {
+        return internal_error(error);
+    }
+    drop(lock);
     *state.registry.write().await = registry;
     (StatusCode::OK, Json(PairResponse { uuid, token })).into_response()
 }
@@ -433,7 +429,7 @@ async fn shutdown_signal() {
             .expect("failed to install SIGTERM handler")
             .recv()
             .await;
-    };
+    }
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
